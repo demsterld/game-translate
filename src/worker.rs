@@ -19,6 +19,10 @@ const CONTEXT_LINES: usize = 4;
 const CACHE_LIMIT: usize = 1000;
 const STABLE_TICKS: u32 = 2;
 const MIN_LETTERS: usize = 3;
+/// How many recent lines are remembered to recognize a line that OCR reads again.
+const RECENT_PHRASES: usize = 8;
+/// Shortest start of a line (in letters and digits) that counts as "the same line, cut off".
+const MIN_PREFIX: usize = 12;
 
 pub enum Cmd {
     SetRegion(Region),
@@ -28,7 +32,10 @@ pub enum Cmd {
 }
 
 pub enum Event {
+    /// A new line: appended to the feed.
     Translation(Entry),
+    /// A better reading of the line already at the bottom of the feed: replaces it.
+    Update(Entry),
     /// Short-lived service message.
     Status(String),
     /// Stays on screen until the next translation.
@@ -73,6 +80,53 @@ struct Worker {
     last_text: String,
     context: VecDeque<String>,
     cache: HashMap<String, Entry>,
+    recent: VecDeque<Phrase>,
+    /// Whether the bottom of the feed shows `recent.back()` and may be updated in place.
+    last_is_live: bool,
+}
+
+/// A line of dialogue shown in the feed, identified by its text without the speaker name.
+struct Phrase {
+    body: Vec<char>,
+    heading: Option<String>,
+    requests: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Match {
+    /// Same line, OCR noise aside.
+    Same,
+    /// The line got longer: a typewriter animation finished or more text became readable.
+    Grown,
+    /// Only the beginning of the line was read.
+    Partial,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    New,
+    /// Re-translate and replace the line at this index of `recent`.
+    Update(usize),
+    Skip,
+}
+
+fn decide(recent: &VecDeque<Phrase>, last_is_live: bool, body: &[char], heading: Option<&str>, max_requests: u32) -> Decision {
+    let found = recent.iter().enumerate().rev().find_map(|(i, p)| compare(body, &p.body).map(|m| (i, m)));
+    let Some((i, m)) = found else { return Decision::New };
+    // An older line that reappears (OCR picked up a fading frame) is already in the feed.
+    if !last_is_live || i + 1 != recent.len() {
+        return Decision::Skip;
+    }
+    let p = &recent[i];
+    let better = match m {
+        Match::Grown => true,
+        Match::Same => {
+            let heading_changed = heading.is_some_and(|h| p.heading.as_deref() != Some(h));
+            (heading_changed || body.len() > p.body.len()) && p.requests < max_requests
+        }
+        Match::Partial => false,
+    };
+    if better { Decision::Update(i) } else { Decision::Skip }
 }
 
 impl Worker {
@@ -93,6 +147,8 @@ impl Worker {
             last_text: String::new(),
             context: VecDeque::new(),
             cache: HashMap::new(),
+            recent: VecDeque::new(),
+            last_is_live: false,
         }
     }
 
@@ -142,13 +198,16 @@ impl Worker {
                     self.ui.send(Event::Status("Текст не найден. Попробуй Ctrl+Alt+G (через Gemini Vision)".into()));
                     return Ok(());
                 }
-                self.translate(&paragraphs)?;
+                let src = Entry::from_paragraphs(&paragraphs);
+                self.last_text = src.key();
+                self.translate_new(src)?;
             }
             Cmd::Vision => {
                 let frame = capture::capture(self.region()?)?;
                 self.ui.send(Event::Status("Gemini Vision: перевожу...".into()));
                 let png = capture::to_png(&frame)?;
                 let translation = self.translator()?.translate_image(&png)?;
+                self.last_is_live = false;
                 self.ui.send(Event::Translation(translation));
             }
         }
@@ -178,9 +237,44 @@ impl Worker {
         self.candidate = paragraphs;
 
         if self.stable_ticks >= STABLE_TICKS && !same_text(&text, &self.last_text) {
-            self.translate(&self.candidate.clone())?;
+            self.translate_live(&self.candidate.clone())?;
         }
         Ok(())
+    }
+
+    /// OCR of the same dialogue box alternates between readings (with and without the speaker
+    /// name, with a letter lost), so the text is matched against recent lines first: a new line
+    /// is appended, a better reading of the current one replaces it, anything else is ignored.
+    fn translate_live(&mut self, paragraphs: &[String]) -> Result<()> {
+        let src = Entry::from_paragraphs(paragraphs);
+        self.last_text = src.key();
+        let body = key(&src.body());
+        match decide(&self.recent, self.last_is_live, &body, src.heading(), self.cfg.max_requests_per_phrase) {
+            Decision::New => self.translate_new(src),
+            Decision::Skip => {
+                crate::log::write(format_args!("skip, already shown: {src:?}"));
+                Ok(())
+            }
+            Decision::Update(i) => {
+                let src = match (src.heading(), &self.recent[i].heading) {
+                    (None, Some(h)) => src.with_heading(h),
+                    _ => src,
+                };
+                let (translation, requested) = self.lookup(&src)?;
+                let phrase = &mut self.recent[i];
+                if body.len() >= phrase.body.len() {
+                    phrase.body = body;
+                }
+                if let Some(h) = src.heading() {
+                    phrase.heading = Some(h.to_string());
+                }
+                phrase.requests += u32::from(requested);
+                self.context.pop_back();
+                self.push_context(src.key());
+                self.ui.send(Event::Update(translation));
+                Ok(())
+            }
+        }
     }
 
     /// Skips OCR when the frame is pixel-identical to the previous one.
@@ -195,32 +289,46 @@ impl Worker {
         Ok(self.last_ocr.clone())
     }
 
-    fn translate(&mut self, paragraphs: &[String]) -> Result<()> {
-        let src = Entry::from_paragraphs(paragraphs);
-        let text = src.key();
-        crate::log::write(format_args!("translate: {src:?}"));
-        self.last_text = text.clone();
-        let translation = match self.cache.get(&text) {
-            Some(t) => t.clone(),
-            None => {
-                let context: Vec<String> = self.context.iter().cloned().collect();
-                let t = self.translator()?.translate_entry(&src, &context)?;
-                if self.cache.len() >= CACHE_LIMIT {
-                    self.cache.clear();
-                }
-                self.cache.insert(text.clone(), t.clone());
-                t
-            }
-        };
+    /// Translates `src` and appends it to the feed as a new line.
+    fn translate_new(&mut self, src: Entry) -> Result<()> {
+        let (translation, requested) = self.lookup(&src)?;
+        self.recent.push_back(Phrase {
+            body: key(&src.body()),
+            heading: src.heading().map(str::to_string),
+            requests: u32::from(requested),
+        });
+        if self.recent.len() > RECENT_PHRASES {
+            self.recent.pop_front();
+        }
+        self.last_is_live = true;
+        self.push_context(src.key());
+        self.ui.send(Event::Translation(translation));
+        Ok(())
+    }
 
+    /// Returns the translation and whether the translator had to be called for it.
+    fn lookup(&mut self, src: &Entry) -> Result<(Entry, bool)> {
+        let text = src.key();
+        if let Some(t) = self.cache.get(&text) {
+            return Ok((t.clone(), false));
+        }
+        crate::log::write(format_args!("translate: {src:?}"));
+        let context: Vec<String> = self.context.iter().cloned().collect();
+        let t = self.translator()?.translate_entry(src, &context)?;
+        if self.cache.len() >= CACHE_LIMIT {
+            self.cache.clear();
+        }
+        self.cache.insert(text, t.clone());
+        Ok((t, true))
+    }
+
+    fn push_context(&mut self, text: String) {
         if self.context.back() != Some(&text) {
             self.context.push_back(text);
             if self.context.len() > CONTEXT_LINES {
                 self.context.pop_front();
             }
         }
-        self.ui.send(Event::Translation(translation));
-        Ok(())
     }
 
     fn reset_change_tracking(&mut self) {
@@ -247,8 +355,15 @@ impl Worker {
 /// OCR over an animated background flickers by a character or two between polls, while a
 /// typewriter animation grows the text; only the former counts as "the same text".
 fn same_text(a: &str, b: &str) -> bool {
-    let key = |s: &str| -> Vec<char> { s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect() };
-    let (a, b) = (key(a), key(b));
+    same_keys(&key(a), &key(b))
+}
+
+/// Letters and digits only, lowercased: what is left after OCR noise in punctuation and spacing.
+fn key(s: &str) -> Vec<char> {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+fn same_keys(a: &[char], b: &[char]) -> bool {
     if a == b {
         return true;
     }
@@ -256,7 +371,24 @@ fn same_text(a: &str, b: &str) -> bool {
         return false;
     }
     let max = a.len().max(b.len());
-    levenshtein(&a, &b) * 10 <= max
+    levenshtein(a, b) * 10 <= max
+}
+
+fn compare(new: &[char], old: &[char]) -> Option<Match> {
+    if same_keys(new, old) {
+        Some(Match::Same)
+    } else if new.len() > old.len() && similar_prefix(old, new) {
+        Some(Match::Grown)
+    } else if new.len() < old.len() && similar_prefix(new, old) {
+        Some(Match::Partial)
+    } else {
+        None
+    }
+}
+
+/// `short` reads like the beginning of `long`, allowing a few OCR misreads.
+fn similar_prefix(short: &[char], long: &[char]) -> bool {
+    short.len() >= MIN_PREFIX && levenshtein(short, &long[..short.len()]) * 6 <= short.len()
 }
 
 fn levenshtein(a: &[char], b: &[char]) -> usize {
@@ -275,7 +407,97 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::same_text;
+    use super::*;
+
+    /// Feeds OCR readings through `decide` the way `translate_live` does and returns how many
+    /// feed entries were created and how many translation requests were made.
+    fn replay(readings: &[&[&str]], max_requests: u32) -> (usize, u32) {
+        let mut recent = VecDeque::new();
+        let (mut entries, mut requests) = (0, 0);
+        for reading in readings {
+            let paragraphs: Vec<String> = reading.iter().map(|s| s.to_string()).collect();
+            let src = Entry::from_paragraphs(&paragraphs);
+            let body = key(&src.body());
+            match decide(&recent, true, &body, src.heading(), max_requests) {
+                Decision::New => {
+                    entries += 1;
+                    requests += 1;
+                    recent.push_back(Phrase { body, heading: src.heading().map(str::to_string), requests: 1 });
+                }
+                Decision::Update(i) => {
+                    requests += 1;
+                    let p: &mut Phrase = &mut recent[i];
+                    if body.len() >= p.body.len() {
+                        p.body = body;
+                    }
+                    if let Some(h) = src.heading() {
+                        p.heading = Some(h.to_string());
+                    }
+                    p.requests += 1;
+                }
+                Decision::Skip => {}
+            }
+        }
+        (entries, requests)
+    }
+
+    const LEVIATHAN: &[&[&str]] = &[
+        &["Chimera", "Leviathan hides Its message in another dimension."],
+        &["Leviathan hides Its message in another dimension."],
+        &["e*Chimera", "Leviathan hides Its message in another dimension."],
+        &["Leviathan hides Its message in another dimension."],
+        &["<Chimera", "Leviathan hides Its message in another dimension."],
+        &["Leviathan hides Its message in another dimension."],
+        &["Chimera", "Leviathan hides Its message in another dimensio ."],
+        &["e\"tChimera", "Leviathan hides Its message in another dimension."],
+        &["SChimera", "Leviathan hides Its message in another dimension."],
+        &["73?Chimera", "Leviathan hides Its message in another dimension."],
+        &["Leviathan hides Its message in another dimension."],
+    ];
+
+    const LAMB: &[&[&str]] = &[
+        &["The Sentinel's power you bear. Its hour has come, little lam ."],
+        &["..?Chimera", "The Sentinel's power you bear. Its hour has come, little lamb."],
+        &["The Sentinel's power you bear. Its hour has come, little lam ."],
+        &["<*Chimera", "The Sentinel's power you bear. Its hour has come, little lamb."],
+        &["The Sentinel's power you bear. Its hour come,"],
+        &["The Sentinel's power you bear. Its hour has come, little lam ."],
+        &["T*Chimera", "The Sentinel's power you bear. Its hour has come, little lam ."],
+        &["The Sentinel's power you bear. Its hour has come, little lamb."],
+        &["T*Chimera", "The Sentinel's power you bear. Its hour has come, little lamb."],
+    ];
+
+    #[test]
+    fn flickering_line_is_one_entry() {
+        assert_eq!(replay(LEVIATHAN, 3), (1, 1));
+    }
+
+    #[test]
+    fn speaker_name_and_fixed_letter_update_in_place() {
+        let (entries, requests) = replay(LAMB, 3);
+        assert_eq!(entries, 1);
+        assert!(requests <= 3, "{requests} requests");
+    }
+
+    #[test]
+    fn request_limit_is_respected() {
+        assert_eq!(replay(LAMB, 1), (1, 1));
+    }
+
+    #[test]
+    fn dialogue_moves_on() {
+        let both: Vec<&[&str]> = LEVIATHAN.iter().chain(LAMB).copied().collect();
+        assert_eq!(replay(&both, 3).0, 2);
+    }
+
+    #[test]
+    fn typewriter_text_grows_in_place() {
+        let readings: &[&[&str]] = &[
+            &["The Sentinel's power you bear. Its hour has c0"],
+            &["The Sentinel's power you bear. Its hour has come, little lamb."],
+        ];
+        assert_eq!(replay(readings, 1), (1, 2));
+    }
 
     #[test]
     fn ocr_flicker_is_same_text() {

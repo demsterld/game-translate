@@ -41,6 +41,10 @@ pub struct Config {
     pub opacity: u8,
     /// How many recent translations the overlay feed keeps.
     pub history_size: usize,
+    /// How many times live mode may re-translate the same line when OCR reads it slightly
+    /// differently (a speaker name appears, a letter is fixed); after that the translation
+    /// already on screen is kept.
+    pub max_requests_per_phrase: u32,
     /// Overlay height limit as a share of the monitor height; older entries are dropped to fit.
     pub max_height_percent: i32,
     pub region: Option<Region>,
@@ -65,6 +69,7 @@ impl Default for Config {
             font_size: 22,
             opacity: 225,
             history_size: 5,
+            max_requests_per_phrase: 3,
             max_height_percent: 45,
             region: None,
             overlay_rect: None,

@@ -158,6 +158,19 @@ pub fn push_entry(entry: Entry, region: Option<Region>) {
     });
 }
 
+/// Replaces the newest translation with a better reading of the same line.
+pub fn replace_last(entry: Entry, region: Option<Region>) {
+    let mut entry = Some(entry);
+    with_state(|s| {
+        if let Some(last) = s.feed.back_mut() {
+            *last = entry.take().unwrap();
+        }
+    });
+    if let Some(entry) = entry {
+        push_entry(entry, region);
+    }
+}
+
 /// Shows a service message under the feed; with `transient` it disappears after a few seconds.
 pub fn set_status(text: &str, region: Option<Region>, transient: bool) {
     with_state(|s| {

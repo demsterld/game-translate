@@ -126,6 +126,7 @@ fn run() -> Result<()> {
                 while let Ok(ev) = events.try_recv() {
                     match ev {
                         Event::Translation(entry) => overlay::push_entry(entry, cfg.region),
+                        Event::Update(entry) => overlay::replace_last(entry, cfg.region),
                         Event::Status(s) => overlay::set_status(&s, cfg.region, true),
                         Event::Error(e) => overlay::set_status(&e, cfg.region, false),
                         Event::Live(on) => overlay::set_status(
