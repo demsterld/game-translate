@@ -44,6 +44,9 @@ pub struct Config {
     /// Overlay height limit as a share of the monitor height; older entries are dropped to fit.
     pub max_height_percent: i32,
     pub region: Option<Region>,
+    /// Overlay position pinned with Ctrl+Alt+W; `h` is the height limit. Absent means the
+    /// overlay follows the capture region.
+    pub overlay_rect: Option<Region>,
 }
 
 impl Default for Config {
@@ -64,6 +67,7 @@ impl Default for Config {
             history_size: 5,
             max_height_percent: 45,
             region: None,
+            overlay_rect: None,
         }
     }
 }

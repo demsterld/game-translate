@@ -31,6 +31,8 @@ enum Action {
     Once,
     Vision,
     Hide,
+    Move,
+    ResetPosition,
     Quit,
 }
 
@@ -40,6 +42,8 @@ const HOTKEYS: &[(Action, char)] = &[
     (Action::Once, 'S'),
     (Action::Vision, 'G'),
     (Action::Hide, 'H'),
+    (Action::Move, 'W'),
+    (Action::ResetPosition, 'N'),
     (Action::Quit, 'Q'),
 ];
 
@@ -49,6 +53,8 @@ const HELP: &str = "Game Translate\n\
     Ctrl+Alt+S — перевести один раз\n\
     Ctrl+Alt+G — перевести картинкой через Gemini Vision\n\
     Ctrl+Alt+H — скрыть/показать окно\n\
+    Ctrl+Alt+W — переместить окно / закрепить\n\
+    Ctrl+Alt+N — вернуть окно к области\n\
     Ctrl+Alt+Q — выход";
 
 fn main() {
@@ -67,8 +73,13 @@ fn run() -> Result<()> {
     let (cmd_tx, events) = worker::spawn(cfg.clone(), unsafe { GetCurrentThreadId() });
 
     overlay::init(&cfg)?;
-    register_hotkeys()?;
-    overlay::set_status(HELP, cfg.region, false);
+    let busy = register_hotkeys();
+    if busy.is_empty() {
+        overlay::set_status(HELP, cfg.region, false);
+    } else {
+        let warning = format!("{HELP}\n\nЗаняты другой программой и не работают: {}", busy.join(", "));
+        overlay::set_status(&warning, cfg.region, false);
+    }
 
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -87,6 +98,19 @@ fn run() -> Result<()> {
                     Action::Vision => Some(Cmd::Vision),
                     Action::Hide => {
                         overlay::toggle_visible();
+                        None
+                    }
+                    Action::Move => {
+                        if let Some(rect) = overlay::toggle_move() {
+                            cfg.overlay_rect = Some(rect);
+                            save_with_status(&cfg, "Окно закреплено");
+                        }
+                        None
+                    }
+                    Action::ResetPosition => {
+                        overlay::reset_position();
+                        cfg.overlay_rect = None;
+                        save_with_status(&cfg, "Окно снова следует за областью");
                         None
                     }
                     Action::Quit => {
@@ -144,7 +168,15 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn register_hotkeys() -> Result<()> {
+fn save_with_status(cfg: &config::Config, done: &str) {
+    match config::save(cfg) {
+        Ok(()) => overlay::set_status(done, cfg.region, true),
+        Err(e) => overlay::set_status(&format!("Не удалось сохранить настройки: {e:#}"), cfg.region, false),
+    }
+}
+
+/// Registers all hotkeys and returns the ones another program already owns.
+fn register_hotkeys() -> Vec<String> {
     let mods: HOT_KEY_MODIFIERS = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
     let mut busy = Vec::new();
     for (id, &(_, key)) in HOTKEYS.iter().enumerate() {
@@ -152,8 +184,5 @@ fn register_hotkeys() -> Result<()> {
             busy.push(format!("Ctrl+Alt+{key}"));
         }
     }
-    if !busy.is_empty() {
-        anyhow::bail!("Горячие клавиши заняты другой программой: {}", busy.join(", "));
-    }
-    Ok(())
+    busy
 }

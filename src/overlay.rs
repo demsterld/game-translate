@@ -1,8 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use anyhow::Result;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
     DEFAULT_CHARSET, DT_CALCRECT, DT_NOPREFIX, DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE,
@@ -11,9 +11,11 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, GetClientRect, HWND_TOPMOST, KillTimer, LWA_ALPHA,
-    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetLayeredWindowAttributes, SetTimer,
-    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WM_PAINT, WM_TIMER, WNDCLASSW,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW,
+    GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    HWND_TOPMOST, KillTimer, LWA_ALPHA, MINMAXINFO, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SetLayeredWindowAttributes, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, WDA_EXCLUDEFROMCAPTURE, WM_GETMINMAXINFO, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
@@ -27,6 +29,14 @@ const MIN_WIDTH: i32 = 420;
 const MAX_WIDTH: i32 = 900;
 const STATUS_TIMER: usize = 1;
 const STATUS_MS: u32 = 4000;
+/// Smallest overlay size the user can drag it to in move mode.
+const MOVE_MIN_WIDTH: i32 = 300;
+const MOVE_MIN_HEIGHT: i32 = 160;
+/// Width of the edge strip that resizes the window in move mode.
+const GRIP: i32 = 8;
+const FRAME: i32 = 2;
+const MOVE_HINT: &str = "Перетащите окно мышью, потяните за край, чтобы изменить размер.\n\
+    Ctrl+Alt+W — закрепить здесь, Ctrl+Alt+N — вернуть к области";
 
 const BACKGROUND: (u8, u8, u8) = (22, 26, 32);
 const HEADING: (u8, u8, u8) = (240, 200, 90);
@@ -47,11 +57,17 @@ struct State {
     feed: VecDeque<Entry>,
     status: Option<String>,
     region: Option<Region>,
+    /// User-chosen position; `h` is the height limit. `None` follows the capture region.
+    pinned: Option<Region>,
+    moving: bool,
     visible: bool,
 }
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    /// Copy of `State::moving` for messages that Windows sends synchronously from inside
+    /// `SetWindowPos`, while `STATE` is already borrowed.
+    static MOVING: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn init(cfg: &Config) -> Result<()> {
@@ -97,6 +113,8 @@ pub fn init(cfg: &Config) -> Result<()> {
                 feed: VecDeque::new(),
                 status: None,
                 region: cfg.region,
+                pinned: cfg.overlay_rect,
+                moving: false,
                 visible: true,
             })
         });
@@ -159,13 +177,62 @@ pub fn toggle_visible() {
     with_state(|s| s.visible = !s.visible);
 }
 
-fn with_state(f: impl FnOnce(&mut State)) {
-    STATE.with_borrow_mut(|s| {
-        if let Some(s) = s.as_mut() {
-            f(s);
-            refresh(s);
+/// Switches between the click-through overlay and a draggable, resizable window.
+/// Returns the new pinned position when move mode ends.
+pub fn toggle_move() -> Option<Region> {
+    with_state(|s| unsafe {
+        if s.moving {
+            let mut r = RECT::default();
+            let _ = GetWindowRect(s.hwnd, &mut r);
+            let rect = Region { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top };
+            s.pinned = Some(rect);
+            end_move(s);
+            return Some(rect);
+        }
+        s.moving = true;
+        s.visible = true;
+        MOVING.set(true);
+        set_click_through(s.hwnd, false);
+        let (x, y, width, height, max_height) = place(s);
+        let height = if s.pinned.is_some() { max_height } else { height.max(MOVE_MIN_HEIGHT) };
+        let _ = SetWindowPos(s.hwnd, Some(HWND_TOPMOST), x, y, width, height, SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+        None
+    })
+    .flatten()
+}
+
+/// Forgets the pinned position, so the overlay follows the capture region again.
+pub fn reset_position() {
+    with_state(|s| {
+        s.pinned = None;
+        if s.moving {
+            unsafe { end_move(s) };
         }
     });
+}
+
+unsafe fn end_move(s: &mut State) {
+    s.moving = false;
+    MOVING.set(false);
+    unsafe { set_click_through(s.hwnd, true) };
+}
+
+unsafe fn set_click_through(hwnd: HWND, on: bool) {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let flag = WS_EX_TRANSPARENT.0 as isize;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, if on { style | flag } else { style & !flag });
+    }
+}
+
+fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    STATE.with_borrow_mut(|s| {
+        let s = s.as_mut()?;
+        let result = f(s);
+        refresh(s);
+        Some(result)
+    })
 }
 
 enum Item {
@@ -186,6 +253,13 @@ unsafe fn layout(s: &State, width: i32) -> Layout {
     let entry_gap = s.font_size * 2 / 3;
     let mut items = Vec::new();
     let mut y = PADDING;
+
+    if s.moving {
+        let mut text: Vec<u16> = MOVE_HINT.encode_utf16().collect();
+        let height = unsafe { measure(s.status_font, &mut text, inner) };
+        items.push(Item::Text { font: s.status_font, color: rgb(HEADING, 1.0), text, top: y, height });
+        y += height + entry_gap;
+    }
 
     let count = s.feed.len();
     for (i, entry) in s.feed.iter().enumerate() {
@@ -225,9 +299,35 @@ unsafe fn layout(s: &State, width: i32) -> Layout {
 /// Recomputes size and position, dropping the oldest entries that do not fit, and repaints.
 fn refresh(s: &mut State) {
     unsafe {
+        if s.moving {
+            let _ = InvalidateRect(Some(s.hwnd), None, true);
+            return;
+        }
         if !s.visible || (s.feed.is_empty() && s.status.is_none()) {
             let _ = ShowWindow(s.hwnd, SW_HIDE);
             return;
+        }
+
+        let (x, y, width, height, _) = place(s);
+        let _ = SetWindowPos(s.hwnd, Some(HWND_TOPMOST), x, y, width, height, SWP_NOACTIVATE);
+        let _ = InvalidateRect(Some(s.hwnd), None, true);
+        let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+/// Returns `(x, y, width, height, max_height)`: at the pinned position if there is one,
+/// otherwise next to the capture region.
+unsafe fn place(s: &mut State) -> (i32, i32, i32, i32, i32) {
+    unsafe {
+        if let Some(p) = s.pinned {
+            // The nearest monitor keeps the overlay reachable if the pinned one was unplugged.
+            let monitor = monitor_rect(p);
+            let width = p.w.max(MOVE_MIN_WIDTH).min(monitor.right - monitor.left);
+            let max_height = p.h.max(MOVE_MIN_HEIGHT).min(monitor.bottom - monitor.top);
+            let height = fit(s, width, max_height);
+            let x = p.x.clamp(monitor.left, (monitor.right - width).max(monitor.left));
+            let y = p.y.clamp(monitor.top, (monitor.bottom - max_height).max(monitor.top));
+            return (x, y, width, height, max_height);
         }
 
         let anchor = s.region.unwrap_or(Region { x: 40, y: 40, w: 0, h: 0 });
@@ -235,13 +335,7 @@ fn refresh(s: &mut State) {
         let monitor_w = monitor.right - monitor.left;
         let width = anchor.w.clamp(MIN_WIDTH, MAX_WIDTH).min(monitor_w);
         let max_height = (monitor.bottom - monitor.top) * s.max_height_percent / 100;
-
-        let mut height = layout(s, width).height;
-        while height > max_height && s.feed.len() > 1 {
-            s.feed.pop_front();
-            height = layout(s, width).height;
-        }
-        let height = height.min(max_height);
+        let height = fit(s, width, max_height);
 
         let x = anchor.x.clamp(monitor.left, (monitor.right - width).max(monitor.left));
         let mut y = anchor.y + anchor.h + GAP;
@@ -251,10 +345,19 @@ fn refresh(s: &mut State) {
         if y < monitor.top {
             y = anchor.y.clamp(monitor.top, (monitor.bottom - height).max(monitor.top));
         }
+        (x, y, width, height, max_height)
+    }
+}
 
-        let _ = SetWindowPos(s.hwnd, Some(HWND_TOPMOST), x, y, width, height, SWP_NOACTIVATE);
-        let _ = InvalidateRect(Some(s.hwnd), None, true);
-        let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+/// Drops the oldest entries until the feed fits into `max_height`; returns the resulting height.
+unsafe fn fit(s: &mut State, width: i32, max_height: i32) -> i32 {
+    unsafe {
+        let mut height = layout(s, width).height;
+        while height > max_height && s.feed.len() > 1 {
+            s.feed.pop_front();
+            height = layout(s, width).height;
+        }
+        height.min(max_height)
     }
 }
 
@@ -320,7 +423,43 @@ unsafe fn paint(hwnd: HWND, dc: HDC) {
                     }
                 }
             }
+            if s.moving {
+                let brush = CreateSolidBrush(rgb(HEADING, 1.0));
+                let (w, h) = (client.right, client.bottom);
+                for edge in [
+                    RECT { left: 0, top: 0, right: w, bottom: FRAME },
+                    RECT { left: 0, top: h - FRAME, right: w, bottom: h },
+                    RECT { left: 0, top: 0, right: FRAME, bottom: h },
+                    RECT { left: w - FRAME, top: 0, right: w, bottom: h },
+                ] {
+                    FillRect(dc, &edge, brush);
+                }
+                let _ = DeleteObject(brush.into());
+            }
         });
+    }
+}
+
+/// Edges resize the window, everything else drags it.
+unsafe fn hit_test(hwnd: HWND, lparam: LPARAM) -> u32 {
+    let x = (lparam.0 & 0xFFFF) as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+    let mut r = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+    let left = x < r.left + GRIP;
+    let right = x >= r.right - GRIP;
+    let top = y < r.top + GRIP;
+    let bottom = y >= r.bottom - GRIP;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, ..) => HTLEFT,
+        (_, true, ..) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (.., true) => HTBOTTOM,
+        _ => HTCAPTION,
     }
 }
 
@@ -337,6 +476,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_TIMER if wparam.0 == STATUS_TIMER => {
                 let _ = KillTimer(Some(hwnd), STATUS_TIMER);
                 with_state(|s| s.status = None);
+                LRESULT(0)
+            }
+            WM_NCHITTEST if MOVING.get() => LRESULT(hit_test(hwnd, lparam) as isize),
+            WM_GETMINMAXINFO => {
+                let info = &mut *(lparam.0 as *mut MINMAXINFO);
+                info.ptMinTrackSize = POINT { x: MOVE_MIN_WIDTH, y: MOVE_MIN_HEIGHT };
+                LRESULT(0)
+            }
+            WM_SIZE => {
+                let _ = InvalidateRect(Some(hwnd), None, true);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
