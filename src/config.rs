@@ -57,9 +57,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             engine: "auto".into(),
-            model: "gemini-flash-lite-latest".into(),
+            model: "gemini-3.5-flash-lite".into(),
             gemini_thinking: "minimal".into(),
-            gemini_timeout_ms: 6000,
+            gemini_timeout_ms: 10000,
             proxy: String::new(),
             target_language: "Russian".into(),
             target_code: "ru".into(),

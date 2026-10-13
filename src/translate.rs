@@ -73,7 +73,9 @@ impl Translator {
                         Ok(t) => t,
                         Err(gemini_err) => {
                             crate::log::write(format_args!("gemini failed, using google: {gemini_err:#}"));
-                            self.gemini_down_until.set(Some(Instant::now() + GEMINI_RETRY_AFTER));
+                            if cooldown_after_failure(&gemini_err) {
+                                self.gemini_down_until.set(Some(Instant::now() + GEMINI_RETRY_AFTER));
+                            }
                             self.google_blocks(&texts)
                                 .with_context(|| format!("Gemini тоже недоступен: {gemini_err:#}"))?
                         }
@@ -163,6 +165,28 @@ impl Translator {
     fn generate(&self, system: &str, parts: Vec<Value>, timeout: Duration, schema: Option<Value>) -> Result<String> {
         let key = self.api_key.as_deref().ok_or_else(|| anyhow!("не задана переменная окружения GEMINI_API_KEY"))?;
         let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", self.model);
+        match self.generate_once(key, &url, system, parts.clone(), timeout, schema.clone()) {
+            Ok(text) => Ok(text),
+            Err(err) if retryable(&err) => {
+                crate::log::write(format_args!("gemini retry: {err:#}"));
+                std::thread::sleep(Duration::from_millis(400));
+                self.generate_once(key, &url, system, parts, timeout, schema).map_err(|retry| {
+                    retry.context(format!("повтор тоже не удался ({err:#})"))
+                })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn generate_once(
+        &self,
+        key: &str,
+        url: &str,
+        system: &str,
+        parts: Vec<Value>,
+        timeout: Duration,
+        schema: Option<Value>,
+    ) -> Result<String> {
         let mut generation = json!({ "temperature": 0.2 });
         let with_thinking = !self.thinking.is_empty() && self.thinking_supported.get();
         if with_thinking {
@@ -174,7 +198,7 @@ impl Translator {
         }
         let body = json!({
             "systemInstruction": { "parts": [{ "text": system }] },
-            "contents": [{ "role": "user", "parts": parts }],
+            "contents": [{ "role": "user", "parts": parts.clone() }],
             "generationConfig": generation,
         });
 
@@ -194,7 +218,7 @@ impl Translator {
             if with_thinking && status == reqwest::StatusCode::BAD_REQUEST && msg.contains("hinking") {
                 crate::log::write(format_args!("model {} rejected thinking level: {msg}", self.model));
                 self.thinking_supported.set(false);
-                return self.generate(system, parts, timeout, schema);
+                return self.generate_once(key, url, system, parts, timeout, schema);
             }
             let reasons: Vec<&str> = value["error"]["details"]
                 .as_array()
@@ -213,6 +237,18 @@ impl Translator {
         }
         Ok(text.trim().to_string())
     }
+}
+
+fn retryable(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains(" 503 ") || msg.contains(" 429 ")
+}
+
+/// 503/429 mean the model is overloaded; skip Gemini for a minute. A one-off timeout
+/// should not lock the next line onto Google Translate.
+fn cooldown_after_failure(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains(" 503 ") || msg.contains(" 429 ") || msg.contains("location is not supported")
 }
 
 #[cfg(test)]
